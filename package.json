@@ -1,0 +1,16 @@
+{
+  "name": "workbuddy-bridge",
+  "version": "0.2.0",
+  "description": "OpenAI-compatible local proxy for desktop AI clients: protocol conversion, image/context guardrails, upstream adapters",
+  "type": "module",
+  "main": "server.mjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test/e2e.mjs"
+  },
+  "license": "MIT",
+  "private": true
+}

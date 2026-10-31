@@ -1,8 +1,11 @@
-// WorkBuddy 积分 → OpenAI 兼容本地桥
-// 监听 127.0.0.1:8787。两种前端都能接:
-//   POST /v1/chat/completions   (OpenAI Chat Completions)
-//   POST /v1/responses          (OpenAI Responses)
-// 上游复用 dsh-connect-workbuddy 的 lib(需自行放到 vendor/wb,宿主依赖打了桩;见 README)。
+// WorkBuddy bridge — OpenAI-compatible local proxy for desktop AI clients.
+//
+// Two upstreams are supported:
+//   openai     any OpenAI-compatible endpoint (DeepSeek, OpenAI, Ollama, vLLM, …)
+//   workbuddy  the WorkBuddy desktop channel through a local adapter in vendor/wb (optional)
+//
+// Select with WB_UPSTREAM=openai|workbuddy|auto (default auto: openai when
+// WB_UPSTREAM_BASE_URL is set, otherwise workbuddy when vendor/wb exists).
 import http from 'node:http';
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -10,12 +13,12 @@ import { execFile } from 'node:child_process';
 
 const HERE = new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
 const PORT = Number(process.env.WB_BRIDGE_PORT || 8787);
+const HOST = process.env.WB_BRIDGE_HOST || '127.0.0.1';
 const TOKEN = process.env.WB_BRIDGE_TOKEN || 'wb-local';
-// 模型统一覆盖(可用 WB_BRIDGE_MODEL 改;设成 auto 表示不覆盖,客户端给什么用什么)。
-const MODEL_OVERRIDE = String(process.env.WB_BRIDGE_MODEL ?? 'deepseek-v4.1-flash').trim();
+// Model override applied to every request (WB_BRIDGE_MODEL=auto disables it).
+const MODEL_OVERRIDE = String(process.env.WB_BRIDGE_MODEL ?? '').trim();
 const overrideOn = () => MODEL_OVERRIDE !== '' && MODEL_OVERRIDE.toLowerCase() !== 'auto';
-// 客户端配置里存的 API Key 可能和 TOKEN 不一致 → 401 收不到回复。
-// 若设置了 WB_PROVIDER_CONFIG(指向宿主 provider 的 config.json),把它里面的 secret 也一并认。
+// A host application may keep its own key for this bridge; trust it as well.
 const COO_PROVIDER_CFG = process.env.WB_PROVIDER_CONFIG || '';
 const EXTRA_TOKENS = (() => {
   if (!COO_PROVIDER_CFG) return [];
@@ -33,13 +36,55 @@ const tokenOk = (auth) => {
 };
 const LOGFILE = HERE + 'bridge.log';
 
-const m = await import(pathToFileURL(HERE + 'vendor/wb/index.js').href);
-
 const log = (...a) => {
   const line = new Date().toISOString().slice(11, 19) + ' ' + a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ');
   console.log(line);
   try { fs.appendFileSync(LOGFILE, line + '\n'); } catch {}
 };
+
+// ---------- upstream selection ----------
+const UPSTREAM_BASE_URL = String(process.env.WB_UPSTREAM_BASE_URL || '').replace(/\/+$/, '');
+const UPSTREAM_API_KEY = String(process.env.WB_UPSTREAM_API_KEY || '');
+const UPSTREAM_KIND = String(process.env.WB_UPSTREAM || 'auto').toLowerCase();
+const VENDOR_ENTRY = HERE + 'vendor/wb/index.js';
+
+let wb = null;              // vendor module, loaded lazily
+let driver = null;          // 'openai' | 'workbuddy'
+
+function vendorPresent() {
+  try { return fs.statSync(VENDOR_ENTRY).isFile(); } catch { return false; }
+}
+
+async function loadWorkBuddy() {
+  if (wb) return wb;
+  wb = await import(pathToFileURL(VENDOR_ENTRY).href);
+  return wb;
+}
+
+async function resolveDriver() {
+  if (driver) return driver;
+  if (UPSTREAM_KIND === 'openai') driver = 'openai';
+  else if (UPSTREAM_KIND === 'workbuddy') driver = 'workbuddy';
+  else if (UPSTREAM_BASE_URL) driver = 'openai';
+  else if (vendorPresent()) driver = 'workbuddy';
+  else driver = null;
+  if (driver === 'openai' && !UPSTREAM_BASE_URL) {
+    throw new Error('WB_UPSTREAM=openai needs WB_UPSTREAM_BASE_URL (e.g. https://api.deepseek.com/v1)');
+  }
+  if (driver === 'workbuddy' && !vendorPresent()) {
+    throw new Error(
+      'No upstream configured. Set WB_UPSTREAM_BASE_URL + WB_UPSTREAM_API_KEY for any OpenAI-compatible endpoint, '
+      + 'or place the WorkBuddy adapter at vendor/wb/index.js (see README).',
+    );
+  }
+  if (!driver) {
+    throw new Error(
+      'No upstream configured. Set WB_UPSTREAM_BASE_URL + WB_UPSTREAM_API_KEY for any OpenAI-compatible endpoint, '
+      + 'or place the WorkBuddy adapter at vendor/wb/index.js (see README).',
+    );
+  }
+  return driver;
+}
 
 // 只拦「同一个响应里第二个 pet_say/pet_ask」,其余调用原样放行。
 // 处理方式是丢弃,不是改名:改名会让 Coopanion 把 end_turn 记进历史,
@@ -161,18 +206,24 @@ function tailUser(msgs) {
   return '';
 }
 
-// ---------- 凭据 ----------
-const client = new m.WorkBuddyUpstreamClient((msg) => log('[wb-fallback]', msg));
+// ---------- WorkBuddy adapter (optional) ----------
+let wbClient = null;
+async function workbuddy() {
+  const mod = await loadWorkBuddy();
+  if (!wbClient) wbClient = new mod.WorkBuddyUpstreamClient((msg) => log('[wb-fallback]', msg));
+  return { mod, client: wbClient };
+}
 let cred = null;
 let credAt = 0;
 
 async function getCredential(force = false) {
   if (cred && !force && Date.now() - credAt < 60_000 && cred.expiresAtMs - Date.now() > 5 * 60_000) return cred;
-  const p = m.defaultDesktopAuthCandidates().find((x) => { try { fs.accessSync(x); return true; } catch { return false; } });
-  if (!p) throw new Error('找不到 WorkBuddy 的登录文件,请先在 WorkBuddy 桌面端登录');
-  const key = await m.readAtRestKey();
-  const parsed = m.parseWorkBuddyAuth(fs.readFileSync(p, 'utf8'), p, key);
-  if (!parsed) throw new Error('WorkBuddy 登录文件解不开(可能需要更新 WorkBuddy)');
+  const { mod, client } = await workbuddy();
+  const p = mod.defaultDesktopAuthCandidates().find((x) => { try { fs.accessSync(x); return true; } catch { return false; } });
+  if (!p) throw new Error('WorkBuddy auth file not found; sign in to the WorkBuddy desktop app first');
+  const key = await mod.readAtRestKey();
+  const parsed = mod.parseWorkBuddyAuth(fs.readFileSync(p, 'utf8'), p, key);
+  if (!parsed) throw new Error('cannot decrypt the WorkBuddy auth file (the app may have changed)');
   cred = parsed; credAt = Date.now();
   if (parsed.expiresAtMs - Date.now() < 5 * 60_000) {
     try {
@@ -186,18 +237,60 @@ async function getCredential(force = false) {
   return cred;
 }
 
-// ---------- 模型目录 ----------
+// ---------- model catalog ----------
 let models = null, modelsAt = 0;
 async function getModels() {
   if (models && Date.now() - modelsAt < 5 * 60_000) return models;
+  if ((await resolveDriver()) === 'openai') {
+    try {
+      const r = await fetch(UPSTREAM_BASE_URL + '/models', {
+        headers: UPSTREAM_API_KEY ? { authorization: 'Bearer ' + UPSTREAM_API_KEY } : {},
+        signal: AbortSignal.timeout(10_000),
+      });
+      const j = await r.json();
+      const list = Array.isArray(j?.data) ? j.data : Array.isArray(j) ? j : null;
+      if (list) {
+        models = list.map((x) => ({ id: x.id, supportsImages: x.supportsImages !== false }));
+        modelsAt = Date.now();
+        return models;
+      }
+    } catch (e) { log('上游 /models 不可用,用占位目录:', e.message); }
+    models = [{ id: MODEL_OVERRIDE && overrideOn() ? MODEL_OVERRIDE : (process.env.WB_UPSTREAM_MODEL || 'default'), supportsImages: true }];
+    modelsAt = Date.now();
+    return models;
+  }
+  const { mod, client } = await workbuddy();
   try { models = await client.fetchModels(await getCredential()); modelsAt = Date.now(); }
-  catch (e) { log('取目录失败,用静态兜底:', e.message); models = m.fallbackModelsFor('cn'); modelsAt = Date.now() - 4 * 60_000; }
+  catch (e) { log('取目录失败,用静态兜底:', e.message); models = mod.fallbackModelsFor('cn'); modelsAt = Date.now() - 4 * 60_000; }
   return models;
 }
 
-// ---------- 发给上游 ----------
+// ---------- upstream call ----------
+async function callUpstreamOpenAI(chatBody) {
+  const t0 = Date.now();
+  const res = await fetch(UPSTREAM_BASE_URL + '/chat/completions', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(UPSTREAM_API_KEY ? { authorization: 'Bearer ' + UPSTREAM_API_KEY } : {}),
+    },
+    body: JSON.stringify({ ...chatBody, stream: true }),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    log('upstream error:', res.status, t.slice(0, 300));
+    const err = new Error('upstream ' + res.status + ': ' + (t || 'empty body').slice(0, 1000));
+    err.status = res.status;
+    throw err;
+  }
+  log('→', chatBody.model, 'stream=true', Date.now() - t0 + 'ms');
+  return res;
+}
+
 async function callUpstream(chatBody) {
-  const prepared = m.prepareChatBody(JSON.stringify({ ...chatBody, stream: true }), {});
+  if ((await resolveDriver()) === 'openai') return callUpstreamOpenAI(chatBody);
+  const { mod, client } = await workbuddy();
+  const prepared = mod.prepareChatBody(JSON.stringify({ ...chatBody, stream: true }), {});
   const c = await getCredential();
   const t0 = Date.now();
   const result = await client.chatStream(c, prepared);
@@ -457,7 +550,17 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname.replace(/^(\/v1)+(?=\/|$)/, '') || '/';
   try {
     if (req.method === 'GET' && (p === '/healthz' || p === '/')) {
-      return send(res, 200, { ok: true, service: 'workbuddy-bridge', port: PORT, routes: ['/v1/models', '/v1/chat/completions', '/v1/responses'] });
+      return send(res, 200, {
+        ok: true, service: 'workbuddy-bridge', port: PORT, upstream: driver || 'unconfigured',
+        routes: ['/v1/models', '/v1/chat/completions', '/v1/responses'],
+      });
+    }
+
+    // Every other route needs the local token (a missing Authorization header is still
+    // accepted so a same-machine client can live without one).
+    if (!tokenOk(String(req.headers.authorization || ''))) {
+      log('401 拒绝: auth 长度', String(req.headers.authorization || '').length);
+      return send(res, 401, { error: { message: 'bad token', type: 'auth' } });
     }
 
     if (req.method === 'GET' && p === '/profiles') {
@@ -473,7 +576,7 @@ const server = http.createServer(async (req, res) => {
         object: 'list',
         data: (list || []).map((x) => ({
           id: x.id, object: 'model', owned_by: 'workbuddy', created: 0,
-          name: m.workBuddyDisplayName ? m.workBuddyDisplayName(x) : x.name,
+          name: x.name ?? x.id,
           context_window: x.contextWindow, credit_multiplier: x.creditMultiplier,
           supports_images: x.supportsImages, supports_tool_call: x.supportsToolCall,
         })),
@@ -484,9 +587,6 @@ const server = http.createServer(async (req, res) => {
       log('404 ' + req.method + ' ' + url.pathname);
       return send(res, 404, { error: { message: 'no such route: ' + url.pathname } });
     }
-
-    const auth = String(req.headers.authorization || '');
-    if (!tokenOk(auth)) { log('401 拒绝: auth 长度', String(auth).length); return send(res, 401, { error: { message: 'bad token', type: 'auth' } }); }
 
     const chunksBuf = [];
     for await (const c of req) chunksBuf.push(c);
@@ -727,7 +827,16 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  log('WorkBuddy 桥已启动: http://127.0.0.1:' + PORT + '  token=' + (TOKEN ? '需要' : '无'));
-  getCredential().catch((e) => log('预热凭据失败:', e.message));
+server.listen(PORT, HOST, async () => {
+  try {
+    const kind = await resolveDriver();
+    log(`bridge up on http://${HOST}:${PORT}  upstream=${kind}  token=${TOKEN ? 'required' : 'none'}`);
+    if (kind === 'workbuddy') getCredential().catch((e) => log('warm-up failed:', e.message));
+  } catch (e) {
+    log('STARTUP ERROR:', e.message);
+    log('Set WB_UPSTREAM_BASE_URL + WB_UPSTREAM_API_KEY (any OpenAI-compatible endpoint), '
+      + 'or drop the WorkBuddy adapter at vendor/wb/index.js. See README.');
+    server.close();
+    process.exit(1);
+  }
 });
