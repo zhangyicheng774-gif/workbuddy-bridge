@@ -1,0 +1,13 @@
+# 运行时产物,不要提交
+bridge.log
+last-fail.json
+*.bak
+*.bak-*
+*.tmp
+
+# 第三方上游适配层(自行放置,不随仓库分发)
+vendor/
+
+# 本地环境
+.env
+node_modules/
